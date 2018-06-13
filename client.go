@@ -1,111 +1,63 @@
 package main
 
-// zmq clone server two
+//  Clone client Model Two
+//  is still not fully reliable.
 
 import (
 	"./kvsimple"
 	zmq "github.com/pebbe/zmq4"
 
 	"fmt"
-	"math/rand"
 	"time"
 )
 
 func main() {
-	//  Prepare our context and sockets
-	publisher, _ := zmq.NewSocket(zmq.PUB)
-	publisher.Bind("tcp://*:5557")
+	snapshot, _ := zmq.NewSocket(zmq.DEALER)
+	snapshot.Connect("tcp://localhost:5556")
 
-	sequence := int64(0)
-	rand.Seed(time.Now().UnixNano())
+	subscriber, _ := zmq.NewSocket(zmq.SUB)
+	subscriber.SetRcvhwm(100000) // or messages between snapshot and next are lost
+	subscriber.SetSubscribe("")
+	subscriber.Connect("tcp://localhost:5557")
 
-	//  Start state manager and wait for synchronization signal
-	updates, _ := zmq.NewSocket(zmq.PAIR)
-	updates.Bind("inproc://pipe")
-	go state_manager()
-	updates.RecvMessage(0) // "READY"
+	time.Sleep(time.Second) // or messages between snapshot and next are lost
 
-	for {
-		//  Distribute as key-value message
-		sequence++
-		kvmsg := kvsimple.NewKvmsg(sequence)
-		kvmsg.SetKey(fmt.Sprint(rand.Intn(10000)))
-		kvmsg.SetBody(fmt.Sprint(rand.Intn(1000000)))
-		if kvmsg.Send(publisher) != nil {
-			break
-		}
-		if kvmsg.Send(updates) != nil {
-			break
-		}
-	}
-	fmt.Printf("Interrupted\n%d messages out\n", sequence)
-}
-
-//  The state manager task maintains the state and handles requests from
-//  clients for snapshots:
-
-func state_manager() {
 	kvmap := make(map[string]*kvsimple.Kvmsg)
 
-	pipe, _ := zmq.NewSocket(zmq.PAIR)
-	pipe.Connect("inproc://pipe")
-	pipe.SendMessage("READY")
-	snapshot, _ := zmq.NewSocket(zmq.ROUTER)
-	snapshot.Bind("tcp://*:5556")
-
-	poller := zmq.NewPoller()
-	poller.Add(pipe, zmq.POLLIN)
-	poller.Add(snapshot, zmq.POLLIN)
-	sequence := int64(0) //  Current snapshot version number
-LOOP:
+	//  Get state snapshot
+	sequence := int64(0)
+	snapshot.SendMessage("ICANHAZ?")
 	for {
-		polled, err := poller.Poll(-1)
+		kvmsg, err := kvsimple.RecvKvmsg(snapshot)
 		if err != nil {
-			break //  Context has been shut down
+			fmt.Println(err)
+			break //  Interrupted
 		}
-		for _, item := range polled {
-			switch socket := item.Socket; socket {
-			case pipe:
-				//  Apply state update from main thread
-				kvmsg, err := kvsimple.RecvKvmsg(pipe)
-				if err != nil {
-					break LOOP //  Interrupted
-				}
-				sequence, _ = kvmsg.GetSequence()
-				kvmsg.Store(kvmap)
-			case snapshot:
-				//  Execute state snapshot request
-				msg, err := snapshot.RecvMessage(0)
-				if err != nil {
-					break LOOP //  Interrupted
-				}
-				identity := msg[0]
-				//  Request is in second frame of message
-				request := msg[1]
-				if request != "ICANHAZ?" {
-					fmt.Println("E: bad request, aborting")
-					break LOOP
-				}
-				//  Send state snapshot to client
+		if key, _ := kvmsg.GetKey(); key == "KTHXBAI" {
+			sequence, _ = kvmsg.GetSequence()
+			fmt.Printf("Received snapshot=%d\n", sequence)
+			break //  Done
+		}
+		kvmsg.Store(kvmap)
+	}
+	snapshot.Close()
 
-				//  For each entry in kvmap, send kvmsg to client
-				for _, kvmsg := range kvmap {
-					snapshot.Send(identity, zmq.SNDMORE)
-					kvmsg.Send(snapshot)
-				}
-
-				// Give client some time to deal with it.
-				// This reduces the risk that the client won't see
-				// the END message, but it doesn't eliminate the risk.
-				time.Sleep(100 * time.Millisecond)
-
-				//  Now send END message with sequence number
-				fmt.Printf("Sending state shapshot=%d\n", sequence)
-				snapshot.Send(identity, zmq.SNDMORE)
-				kvmsg := kvsimple.NewKvmsg(sequence)
-				kvmsg.SetKey("KTHXBAI")
-				kvmsg.SetBody("")
-				kvmsg.Send(snapshot)
+	first := true
+	//  Now apply pending updates, discard out-of-sequence messages
+	for {
+		kvmsg, err := kvsimple.RecvKvmsg(subscriber)
+		if err != nil {
+			fmt.Println(err)
+			break //  Interrupted
+		}
+		if seq, _ := kvmsg.GetSequence(); seq > sequence {
+			sequence, _ = kvmsg.GetSequence()
+			kvmsg.Store(kvmap)
+			if first {
+				// Show what the first regular update is after the snapshot,
+				// to see if we missed updates.
+				first = false
+				fmt.Println("Next:", sequence)
 			}
 		}
 	}
